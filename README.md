@@ -17,6 +17,7 @@ cockpit create schema / validate ──▶ gateway ──▶ quasar ──▶ et
                                                     └──▶ oort     (async: org→schema inheritance)
 
 kuiper Put/Place (config with schema) ──▶ quasar.ValidateConfiguration
+cockpit image apply (fleet spec)      ──▶ quasar.ValidateConfiguration
                     ◀── {isValid, message} ──┘
 ```
 
@@ -30,9 +31,20 @@ referenced by `schema_details` must already exist in Meridian.
 |---|---|
 | `SaveConfigSchema` | checks namespace exists (Meridian), authorizes, validates the schema document, requires the version to be **strictly newer** (semver) than the latest stored one, rejects an existing key, stores it, then asynchronously adds the org→schema Oort relationship |
 | `GetConfigSchema` | fetches one schema by full details |
+| `ValidateConfiguration` authz before lookup | The permission check runs on the schema id first, so validating against a schema that was never saved answers `permission denied: config.get`, not "not found" (cockpit's `image apply` explains this case). |
 | `DeleteConfigSchema` | deletes one schema key |
 | `ValidateConfiguration` | fetches the schema and validates the given YAML configuration against it (returns `isValid` + message) |
 | `GetConfigSchemaVersions` | lists stored versions by `org/namespace/name` prefix |
+
+### Fleet specs (OS management)
+
+`cockpit image apply` sends every fleet spec, as written, to
+`ValidateConfiguration` against the schema `<org>/default/host-image-spec`
+(version `v1.0.0` by default) before planning. The schema lives in
+`tools/bootc/specs/host-image-spec.schema.yaml` and is registered once per
+org with `cockpit create schema` (after the first claim, which creates the
+`default` namespace). The reply message lists **every** violation, joined
+with `; ` (`path: problem`), so a client can show them all at once.
 
 ## Running
 
@@ -82,8 +94,9 @@ error-model and permission-mapping warts below are accepted for the lab.
 
 ### Disabled / unfinished features
 
-- **No tests** (`go test ./...` → no test files) for schema validation,
-  version ordering, or the etcd repository.
+- **Few tests**: `internal/configschema/validate_test.go` covers validation
+  and the all-errors message; version ordering and the etcd repository have
+  none.
 - `validators.IsConfigurationValid` is a placeholder (checks non-empty
   only); the real validation happens in `configschema.validateConfiguration`
   — the dead-looking helper is a trap for readers.
@@ -96,8 +109,8 @@ error-model and permission-mapping warts below are accepted for the lab.
   validators; other strings are rejected.
 - Plaintext gRPC on the compose network; `SECRET_KEY` is the shared lab
   signing key.
-- JSON Schema support follows `gojsonschema` (draft-04 era semantics), not a
-  newer draft.
+- JSON Schema support follows `gojsonschema`: drafts 04, 06 and 07 (`const`,
+  `propertyNames` work), not 2019-09 / 2020-12.
 
 References: `tools/docs/README.md` (corrected API conventions — config
 validation YAML root key = config name, `schema_details` requires
