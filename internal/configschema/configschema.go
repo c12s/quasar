@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	meridian_api "github.com/c12s/meridian/pkg/api"
 	oortapi "github.com/c12s/oort/pkg/api"
@@ -242,18 +243,24 @@ func (s *Server) ValidateConfiguration(ctx context.Context, in *pb.ValidateConfi
 			IsValid: false,
 		}, nil
 	}
-	var message string
-	if validationResult.Valid() && message == "" {
-		message = "The configuration is valid!"
-	} else {
-		message = validationResult.Errors()[0].String()
-	}
-
 	return &pb.ValidateConfigurationResponse{
 		Status:  0,
-		Message: message,
+		Message: validationMessage(validationResult),
 		IsValid: validationResult.Valid(),
 	}, nil
+}
+
+// validationMessage lists every violation, not only the first, so a client
+// can fix a document in one pass.
+func validationMessage(result *gojsonschema.Result) string {
+	if result.Valid() {
+		return "The configuration is valid!"
+	}
+	msgs := make([]string, 0, len(result.Errors()))
+	for _, e := range result.Errors() {
+		msgs = append(msgs, e.String())
+	}
+	return strings.Join(msgs, "; ")
 }
 
 func validateConfiguration(configuration string, schema string) (*gojsonschema.Result, error) {
