@@ -75,47 +75,6 @@ go run ./cmd/server
 - **Oort**: one async `org → schema` inheritance relationship per saved
   schema (fire-and-forget).
 
-## Status
-
-Stable for schema CRUD and validation as used by Kuiper and cockpit; the
-error-model and permission-mapping warts below are accepted for the lab.
-
-## Bugs, disabled and unfinished features
-
-### Confirmed bugs / design warts
-
-| Where | Effect |
-|---|---|
-| `internal/services/authorization.go` | Schema operations are authorized with **`config.put` / `config.get`** (`PermSchemaPut/Get/Del` map to config permissions) — there is no distinct schema permission. Anyone allowed to write configs in a namespace can also create/delete its schemas. |
-| `internal/configschema/configschema.go` — `ValidateConfiguration` | When the schema lookup fails, the response message is **"Error while instantiating database client!"** even though the client was created fine (missing schema or etcd failure) — misleading diagnosis. |
-| Mixed error model | Permission failures return a plain `fmt.Errorf` (surfaces as gRPC `Unknown`), validation failures return `status: 3` **inside a successful response**, etcd failures `status: 13` in the response. Clients (kuiper, cockpit) must handle both shapes. |
-| `repository.NewClient()` per RPC | A new etcd client (with `defer Close`) is created on **every request** instead of one shared client — extra connections/latency, and client construction errors cannot be distinguished from store errors in the messages above. |
-| `DeleteConfigSchema` | Removes the etcd key only; the `org → schema` Oort relationship stays behind (same fire-and-forget pattern as kuiper). |
-
-### Disabled / unfinished features
-
-- **Few tests**: `internal/configschema/validate_test.go` covers validation
-  and the all-errors message; version ordering and the etcd repository have
-  none.
-- `validators.IsConfigurationValid` is a placeholder (checks non-empty
-  only); the real validation happens in `configschema.validateConfiguration`
-  — the dead-looking helper is a trap for readers.
-- No schema *update* path: a fix means saving a new higher version (by
-  design, but there is no deprecation/cleanup story for old versions).
-
-### PoC boundaries (by design, not bugs)
-
-- Versions must be SemVer **with a `v` prefix** (`v1.0.0`) — enforced by the
-  validators; other strings are rejected.
-- Plaintext gRPC on the compose network; `SECRET_KEY` is the shared lab
-  signing key.
-- JSON Schema support follows `gojsonschema`: drafts 04, 06 and 07 (`const`,
-  `propertyNames` work), not 2019-09 / 2020-12.
-
-References: `tools/docs/README.md` (corrected API conventions — config
-validation YAML root key = config name, `schema_details` requires
-`namespace`), `../kuiper/README.md` (main caller), `../plan/architecture.md`.
-
 ## API reference: request and response examples
 
 The per-RPC examples from the original service documentation (grpcurl
