@@ -1,61 +1,103 @@
-# Quasar - Remote Configuration Schema Service
+# quasar — c12s configuration schema service
 
-This remote service offers a suite of functionalities designed to simplify YAML schema management and validation processes. The service specializes in CRUD operations for YAML schemas, schema validation against specified structures, and accessing version history for a particular schema. 
+Stores versioned **YAML→JSON schemas** per `(org, namespace, name, version)`
+in etcd and validates configurations against them. It is the validation step
+in the config write path and the schema-management backend behind the
+`cockpit schema` commands.
 
-The following remote procedures are available:
+> The Go module is still `github.com/jtomic1/config-schema-service` (the
+> service predates its c12s naming, like gravity/`agent_queue`); the
+> repository, image and container are `quasar`.
 
- - **ConfigSchemaService/SaveConfigSchema**
- - **ConfigSchemaService/GetConfigSchema**
- - **ConfigSchemaService/DeleteConfigSchema**
- - **ConfigSchemaService/ValidateConfiguration**
- - **ConfigSchemaService/GetConfigSchemaVersions**
+## Role in c12s
 
-## Installation Guide
+```
+cockpit create schema / validate ──▶ gateway ──▶ quasar ──▶ etcd (quasar_etcd, schema YAML)
+                                                    ├──▶ meridian (namespace must exist; user/org context)
+                                                    └──▶ oort     (async: org→schema inheritance)
 
-Prerequisites:
- - Go 1.20: Ensure you have Go version 1.20 installed on your machine. You can download and install it from the [official Go website](https://go.dev/).
- - etcd: Install and run etcd, the distributed key-value store. [Installation guide](https://etcd.io/docs/v3.5/install/)
+kuiper Put/Place (config with schema) ──▶ quasar.ValidateConfiguration
+cockpit image apply (fleet spec)      ──▶ quasar.ValidateConfiguration
+                    ◀── {isValid, message} ──┘
+```
 
-Installation:
- 1. Clone this repository.
- 2. Navigate to the following location
-    ```
-    cd <repository_directory>\cmd\server
-    ```
- 3. Start etcd using the appropriate commands for your operating system. For example:
-    ```
-    etcd
-    ```
- 4. Run the server by double-clicking server.exe or running the command
-    ```
-    ./server.exe
-    ```
-Once the Go application is running, the service will be available.
+Schemas are stored as YAML that must be convertible to valid JSON Schema;
+validation uses [gojsonschema] against the stored schema. The namespace
+referenced by `schema_details` must already exist in Meridian.
 
-*Notes*
+## API (`proto/config_schema.proto`, reflection enabled)
 
- - Ensure etcd is running and accessible at localhost:2379 before starting the Go application.
- - The default port for the server is 50051
+| RPC | Behavior |
+|---|---|
+| `SaveConfigSchema` | checks namespace exists (Meridian), authorizes, validates the schema document, requires the version to be **strictly newer** (semver) than the latest stored one, rejects an existing key, stores it, then asynchronously adds the org→schema Oort relationship |
+| `GetConfigSchema` | fetches one schema by full details |
+| `ValidateConfiguration` authz before lookup | The permission check runs on the schema id first, so validating against a schema that was never saved answers `permission denied: config.get`, not "not found" (cockpit's `image apply` explains this case). |
+| `DeleteConfigSchema` | deletes one schema key |
+| `ValidateConfiguration` | fetches the schema and validates the given YAML configuration against it (returns `isValid` + message) |
+| `GetConfigSchemaVersions` | lists stored versions by `org/namespace/name` prefix |
 
+### Fleet specs (OS management)
 
-## ConfigSchemaService/SaveConfigSchema
+`cockpit image apply` sends every fleet spec, as written, to
+`ValidateConfiguration` against the schema `<org>/default/host-image-spec`
+(version `v1.0.0` by default) before planning. The schema lives in
+`tools/bootc/specs/host-image-spec.schema.yaml` and is registered once per
+org with `cockpit create schema` (after the first claim, which creates the
+`default` namespace). The reply message lists **every** violation, joined
+with `; ` (`path: problem`), so a client can show them all at once.
+
+## Running
+
+Compose service `quasar` (port `QUASAR_PORT`, 9090), reflection enabled, with
+a unary interceptor that extracts the `authz-token` metadata into the context.
+
+```bash
+go build ./...   # module name differs from the repo directory name
+go run ./cmd/server
+```
+
+## Configuration (env)
+
+| Variable | Used for |
+|---|---|
+| `SERVER_PORT` | gRPC listen port |
+| `ETCD_ADDRESS` | quasar's own etcd (`quasar_etcd:2379`, volume `quasar_etcd_data`) |
+| `NATS_ADDRESS` | async Oort administration client |
+| `SECRET_KEY` | JWT permission checks |
+| `MERIDIAN_ADDRESS` | namespace lookups |
+
+## Data and dependencies
+
+- **etcd**: keys `<org>/<namespace>/<schemaName>/<version>` → schema YAML.
+  A version is immutable once written (an existing key is rejected).
+- **Meridian**: namespace existence is a precondition for saving; schema
+  deletion does not touch Meridian.
+- **Oort**: one async `org → schema` inheritance relationship per saved
+  schema (fire-and-forget).
+
+## API reference: request and response examples
+
+The per-RPC examples from the original service documentation (grpcurl
+requests against the service port).
+
+### ConfigSchemaService/SaveConfigSchema
 This procedure is used to create a new schema. 
-### Request
+#### Request
 **SaveConfigSchema** accepts a message of type **SaveConfigSchemaRequest**, which consists of the following fields, all of which are <u>required</u>.
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | user    | [User](#user)  | User which has requested to save the schema |
 | schema_details    | [ConfigSchemaDetails](#config-schema-details)  | Details regarding the schema (namespace, name of the schema, and schema version) |
 |schema | string | YAML string representing the schema. Must be convertible into a valid JSON Schema format.|
-### Response
+#### Response
 **SaveConfigSchema** returns a message of type **SaveConfigSchemaResponse**, which consists of the following fields
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | status    | int32  | [gRPC Status Code](https://grpc.github.io/grpc/core/md_doc_statuscodes.html) |
 | message   | string  | Response details |
 
-### Example Usage
-#### Example 1 - Valid Request
+#### Example Usage
+##### Example 1 - Valid Request
 The following example demonstrates a successful request with no errors. 
 
 Request: 
@@ -82,7 +124,7 @@ Response:
 ```
 The value provided in the "schema" field is stored in JSON format under the key **my_namespace/person_address_schema/v1.0.0**
 
-#### Example 2 - Invalid Version
+##### Example 2 - Invalid Version
 Consider the previous example. Since a schema under the key **my_namespace/person_address_schema/v1.0.0** has already been stored, trying to store another schema with the version that doesn't succeed **v1.0.0** would result in an error. In this example, version **v0.1.0** is used. Due to this restriction, it would also be impossible to send multiple requests where schema details are the same.
 
 Request: 
@@ -107,7 +149,7 @@ Response:
 	"message": "Provided version is not latest! Please provide a version that succeeds 'v1.0.0'!"
 }
 ```
-#### Example 3 - Invalid Schema Value
+##### Example 3 - Invalid Schema Value
 In the following example, the value for "schema" is invalid (**Lorem ipsum** - an ordinary string). The server will reject this request because this string cannot be converted into a valid JSON Schema.
 
 Request:
@@ -133,7 +175,7 @@ Response:
 }
 ```
 
-#### Example 4 - Missing Mandatory Fields
+##### Example 4 - Missing Mandatory Fields
 In the following example, the **user** field is omitted from the request. Since it is a mandatory field, the server will reject this request.
 
 Request:
@@ -154,7 +196,7 @@ Response:
 	"message": "User cannot be empty!"
 }
 ```
-#### Example 5 - Invalid Character In Schema Details
+##### Example 5 - Invalid Character In Schema Details
 Currently, only one character is considered illegal when providing schema details - the forward slash. Since it is used as a separator when generating keys for the database, the user is prohibited from including it inside the "schema_details". In this example, it is included inside the namespace.
 
 Request:
@@ -179,7 +221,7 @@ Response:
 	"message": "Schema details must not contain '/'!"
 }
 ```
-#### Example 6 - Invalid SemVer In Schema Details
+##### Example 6 - Invalid SemVer In Schema Details
 The value provided for the schema version must adhere to certain rules. Check out [ConfigSchemaDetails](#config-schema-details) section for more information about the restrictions imposed on this field. The following example provides an ordinary integer in the version field, which is invalid since it doesn't have the "v" prefix.
 ```json 
 {
@@ -202,15 +244,15 @@ Response:
 	"message": "Schema version must be a valid SemVer string with 'v' prefix!"
 }
 ```
-## ConfigSchemaService/GetConfigSchema
+### ConfigSchemaService/GetConfigSchema
 This procedure is used to retrieve a schema.
-### Request
+#### Request
 **GetConfigSchema** accepts a message of type **GetConfigSchemaRequest**, which consists of the following fields, all of which are <u>required</u>.
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | user    | [User](#user)  | User which has requested to get the schema |
 | schema_details    | [ConfigSchemaDetails](#config-schema-details)  | Details regarding the schema (namespace, name of the schema, and schema version) |
-### Response
+#### Response
 **GetConfigSchema** returns a message of type **GetConfigSchemaResponse**, which consists of the following fields
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
@@ -218,8 +260,8 @@ This procedure is used to retrieve a schema.
 | message   | string  | Response details |
 |schema_data|[ConfigSchemaData](#config-schema-data)|Contains the schema value, as well as the creation time and the author
 
-### Example Usage
-#### Example 1 - Valid Request
+#### Example Usage
+##### Example 1 - Valid Request
 The following example demonstrates a successful request with no errors. 
 
 Request: 
@@ -254,7 +296,7 @@ Response:
   }
 }
 ```
-#### Example 2 - Non-existent Key
+##### Example 2 - Non-existent Key
 In the following example, the query contains a schema name which does not exist.
 
 Request:
@@ -280,7 +322,7 @@ Response:
 }
 ```
 
-#### Example 3 - Missing Mandatory Fields
+##### Example 3 - Missing Mandatory Fields
 In the following example, the **schema_name** field is omitted from the request. Since it is a mandatory field, the server will reject this request.
 
 Request:
@@ -304,23 +346,23 @@ Response:
   "schema_data": null
 }
 ```
-## ConfigSchemaService/DeleteConfigSchema
+### ConfigSchemaService/DeleteConfigSchema
 This procedure is used to physically delete a schema.
-### Request
+#### Request
 **DeleteConfigSchema** accepts a message of type **DeleteConfigSchemaRequest**, which consists of the following fields, all of which are <u>required</u>.
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | user    | [User](#user)  | User which has requested to delete the schema |
 | schema_details    | [ConfigSchemaDetails](#config-schema-details)  | Details regarding the schema (namespace, name of the schema, and schema version) |
-### Response
+#### Response
 **DeleteConfigSchema** returns a message of type **DeleteConfigSchemaResponse**, which consists of the following fields
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | status    | int32  | [gRPC Status Code](https://grpc.github.io/grpc/core/md_doc_statuscodes.html) |
 | message   | string  | Response details |
 
-### Example Usage
-#### Example 1 - Valid Request
+#### Example Usage
+##### Example 1 - Valid Request
 The following example demonstrates a successful request with no errors. 
 
 Request: 
@@ -344,7 +386,7 @@ Response:
   "message": "Schema deleted successfully!"
 }
 ```
-#### Example 2 - Non-existent Key
+##### Example 2 - Non-existent Key
 In the following example, the query contains a schema name which does not exist.
 
 Request:
@@ -369,7 +411,7 @@ Response:
 }
 ```
 
-#### Example 3 - Missing Mandatory Fields
+##### Example 3 - Missing Mandatory Fields
 In the following example, the **username** field is omitted from the request. Since it is a mandatory field, the server will reject this request.
 
 Request:
@@ -392,16 +434,16 @@ Response:
   "message": "User's username cannot be empty!"
 }
 ```
-## ConfigSchemaService/ValidateConfiguration
+### ConfigSchemaService/ValidateConfiguration
 This procedure is used to validate a provided YAML  string (configuration) against a previously created schema.
-### Request
+#### Request
 **ValidateConfiguration** accepts a message of type **ValidateConfigurationRequest**, which consists of the following fields, all of which are <u>required</u>.
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | user    | [User](#user)  | User which has requested to validate the configuration |
 | schema_details    | [ConfigSchemaDetails](#config-schema-details)  | Details regarding the schema (namespace, name of the schema, and schema version) |
 |configuration|string|A YAML string which represents the configuration that should be validated
-### Response
+#### Response
 **ValidateConfiguration** returns a message of type **ValidateConfigurationResponse**, which consists of the following fields
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
@@ -409,8 +451,8 @@ This procedure is used to validate a provided YAML  string (configuration) again
 | message   | string  | Response details |
 |is_valid | boolean | Validation result (true if the configuration is valid, false otherwise)
 
-### Example Usage
-#### Example 1 - Valid Request, Valid Configuration
+#### Example Usage
+##### Example 1 - Valid Request, Valid Configuration
 The following example demonstrates a successful request with no errors for a valid configuration. 
 
 Request: 
@@ -436,7 +478,7 @@ Response:
   "is_valid": true
 }
 ```
-#### Example 2 - Valid Request, Invalid Configuration
+##### Example 2 - Valid Request, Invalid Configuration
 The following example demonstrates a successful request with no errors for an invalid configuration. In the following example, the value for "age" is provided as a string, whereas the schema requires the "age" to be an integer. 
 
 Request: 
@@ -463,7 +505,7 @@ Response:
 }
 ```
 
-#### Example 3 - Non-existent Key
+##### Example 3 - Non-existent Key
 In the following example, the query contains a schema name which does not exist.
 
 Request:
@@ -492,23 +534,23 @@ Response:
 <br>
 Omitting a required field is handled in the same manner as in previous endpoints. Naturally, the "is_valid" field in this case is always going to be false.
 
-## ConfigSchemaService/GetConfigSchemaVersions
+### ConfigSchemaService/GetConfigSchemaVersions
 This procedure is used to retrieve all schemas under the given namespace and schema name. Schema array in the response is sorted in ascending order with respect to schemas' semantic version.
-### Request
+#### Request
 **GetConfigSchemaVersions** accepts a message of type **ConfigSchemaVersionsRequest**, which consists of the following fields, all of which are <u>required</u>.
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | user    | [User](#user)  | User which has requested to validate the configuration |
 | schema_details    | [ConfigSchemaDetails](#config-schema-details)  | Details regarding the schema (namespace and schema name). Note that in this case, the "version" field is NOT required |
-### Response
+#### Response
 **GetConfigSchemaVersions** returns a message of type **ConfigSchemaVersionsResponse**, which consists of the following fields
 |parameter| type  |                    description              |
 |---------|-------|---------------------------------------------|
 | status    | int32  | [gRPC Status Code](https://grpc.github.io/grpc/core/md_doc_statuscodes.html) |
 | message   | string  | Response details |
 |schema_versions | Array of [ConfigSchema](#config-schema) objects| Sorted array of [ConfigSchema](#config-schema), which includes schema details and schema value, as well as the author and creation time for each version
-### Example Usage
-#### Example 1 - Valid Request
+#### Example Usage
+##### Example 1 - Valid Request
 The following example demonstrates a successful request with no errors. 
 
 Request: 
@@ -587,7 +629,7 @@ Response:
   "message": "Schema versions retrieved successfully!"
 }
 ```
-#### Example 2 - Non-existent Prefix
+##### Example 2 - Non-existent Prefix
 The following example demonstrates a successful request with no schemas found for the given prefix. 
 
 Request: 
@@ -614,15 +656,15 @@ Response:
 <br>
 Omitting a required field is handled in the same manner as in previous endpoints. Naturally, the "schema_versions" field in this case is always going to be an empty array.
 
-## Custom Types
+### Custom Types
 This section further describes custom types and messages which are defined in the service.
-### <a name="user"></a> User
+#### <a name="user"></a> User
 |property| type  |restrictions|             description              |
 |---------|-------|-------|--------------------------------------|
 | username    | string |Cannot be empty|User's username |
 | email   | string |Cannot be empty| User's email |
 ---
-### <a name="config-schema-details"></a> ConfigSchemaDetails
+#### <a name="config-schema-details"></a> ConfigSchemaDetails
 |property| type  |restrictions|          description              |
 |---------|-------|---------|------------------------------------|
 | namespace    | string | Cannot be empty<br>Cannot contain "/"| Namespace which the schema belongs to|
@@ -632,15 +674,17 @@ This section further describes custom types and messages which are defined in th
 **Note: Version CAN be omitted when sending a request to **ConfigSchemaService/GetConfigSchemaVersions** endpoint*
 
 ---
-### <a name="config-schema-data"></a> ConfigSchemaData
+#### <a name="config-schema-data"></a> ConfigSchemaData
 |property| type  |   restrictions  |               description              |
 |---------|-------|-------|-------------------------------------|
 | user    | [User](#user) |Cannot be empty | User which has created the schema|
 | schema   | string  |Must be a non-empty YAML string which can be converted to a valid JSON Schema| Schema value in YAML format |
 |creation_time|[timestamppb.Timestamp](https://pkg.go.dev/google.golang.org/protobuf/types/known/timestamppb#Timestamp)| Cannot be empty|Time at which the schema was created|
 ---
-### <a name="config-schema"></a> ConfigSchema
+#### <a name="config-schema"></a> ConfigSchema
 |property| type  |   restrictions  |               description              |
 |---------|-------|-------|-------------------------------------|
 | schema_details    | [ConfigSchemaDetails](#config-schema-details) |Cannot be empty | Schema details|
 | schema_data| [ConfigSchemaData](#config-schema-data)  |Cannot be empty| Schema data |
+
+[gojsonschema]: https://github.com/xeipuuv/gojsonschema
